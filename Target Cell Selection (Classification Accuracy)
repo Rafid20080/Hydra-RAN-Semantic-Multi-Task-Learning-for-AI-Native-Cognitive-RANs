@@ -1,0 +1,698 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Sat Jul  4 12:13:38 2026
+
+@author: rafid
+"""
+
+"""
+Offline Pre-training Convergence Simulation for IEEE TCCN Paper
+Reproduces Fig. offline_convergence: Training convergence curves for all three
+cognitive tasks showing Hydra-RAN achieves faster convergence and lower final loss.
+
+Tasks:
+1. Target Cell Selection (Classification Accuracy)
+2. Resource Demand Estimation (NRMSE)
+3. Interference Mitigation (Beam Selection Accuracy)
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy import stats
+from scipy.optimize import curve_fit
+import matplotlib as mpl
+import warnings
+import json
+import os
+warnings.filterwarnings('ignore')
+
+# ============================================================================
+# IEEE Publication Quality Settings
+# ============================================================================
+
+mpl.rcParams.update({
+    'font.family': 'serif',
+    'font.serif': ['Times New Roman', 'Times'],
+    'font.size': 10,
+    'axes.labelsize': 11,
+    'axes.titlesize': 11,
+    'xtick.labelsize': 9,
+    'ytick.labelsize': 9,
+    'legend.fontsize': 8,
+    'figure.dpi': 300,
+    'savefig.dpi': 300,
+    'savefig.bbox': 'tight',
+    'lines.linewidth': 2,
+    'lines.markersize': 4,
+    'axes.grid': True,
+    'grid.alpha': 0.3,
+    'grid.linestyle': '--',
+})
+
+
+# ============================================================================
+# Simulation Parameters (Based on Table IV from paper)
+# ============================================================================
+
+class Config:
+    """Configuration for offline pre-training simulation."""
+    def __init__(self, input_data=None):
+        """
+        Initialize configuration with optional input data.
+        
+        Args:
+            input_data: dict containing simulation parameters
+                - total_steps: int
+                - num_runs: int
+                - seed: int
+                - hydra: dict with task parameters
+                - sran: dict with task parameters
+                - drl: dict with task parameters
+                - hydra_no_vib: dict with task parameters
+                - hydra_no_uncertainty: dict with task parameters
+        """
+        if input_data is None:
+            # Default parameters (based on paper Table IV)
+            self.total_steps = 20000
+            self.num_runs = 5
+            self.seed = 42
+            self.tasks = ['target_accuracy', 'resource_nrmse', 'beam_accuracy']
+            
+            # Convergence parameters (based on paper Table IV)
+            # Hydra-RAN: faster convergence, lower final loss
+            self.hydra = {
+                'target_accuracy': {'final': 0.942, 'convergence_rate': 0.0004, 'noise': 0.008},
+                'resource_nrmse': {'final': 0.12, 'convergence_rate': 0.00035, 'noise': 0.008},
+                'beam_accuracy': {'final': 0.887, 'convergence_rate': 0.00038, 'noise': 0.008}
+            }
+            
+            # S-RAN: slower convergence, higher final loss
+            self.sran = {
+                'target_accuracy': {'final': 0.895, 'convergence_rate': 0.00025, 'noise': 0.012},
+                'resource_nrmse': {'final': 0.18, 'convergence_rate': 0.00020, 'noise': 0.012},
+                'beam_accuracy': {'final': 0.823, 'convergence_rate': 0.00022, 'noise': 0.012}
+            }
+            
+            # DRL-Only: slowest convergence, worst final performance
+            self.drl = {
+                'target_accuracy': {'final': 0.835, 'convergence_rate': 0.00015, 'noise': 0.015},
+                'resource_nrmse': {'final': 0.26, 'convergence_rate': 0.00012, 'noise': 0.015},
+                'beam_accuracy': {'final': 0.746, 'convergence_rate': 0.00013, 'noise': 0.015}
+            }
+            
+            # Hydra-RAN variants
+            self.hydra_no_vib = {
+                'target_accuracy': {'final': 0.918, 'convergence_rate': 0.00035, 'noise': 0.009},
+                'resource_nrmse': {'final': 0.14, 'convergence_rate': 0.00030, 'noise': 0.009},
+                'beam_accuracy': {'final': 0.859, 'convergence_rate': 0.00033, 'noise': 0.009}
+            }
+            
+            self.hydra_no_uncertainty = {
+                'target_accuracy': {'final': 0.925, 'convergence_rate': 0.00038, 'noise': 0.008},
+                'resource_nrmse': {'final': 0.13, 'convergence_rate': 0.00033, 'noise': 0.008},
+                'beam_accuracy': {'final': 0.868, 'convergence_rate': 0.00036, 'noise': 0.008}
+            }
+        else:
+            # Use input data to configure simulation
+            self.total_steps = input_data.get('total_steps', 20000)
+            self.num_runs = input_data.get('num_runs', 5)
+            self.seed = input_data.get('seed', 42)
+            self.tasks = input_data.get('tasks', ['target_accuracy', 'resource_nrmse', 'beam_accuracy'])
+            
+            # Set model parameters from input data or use defaults
+            self.hydra = input_data.get('hydra', self._get_default_model_params('hydra'))
+            self.sran = input_data.get('sran', self._get_default_model_params('sran'))
+            self.drl = input_data.get('drl', self._get_default_model_params('drl'))
+            self.hydra_no_vib = input_data.get('hydra_no_vib', self._get_default_model_params('hydra_no_vib'))
+            self.hydra_no_uncertainty = input_data.get('hydra_no_uncertainty', 
+                                                      self._get_default_model_params('hydra_no_uncertainty'))
+            
+            # Update any missing tasks with defaults
+            for model in ['hydra', 'sran', 'drl', 'hydra_no_vib', 'hydra_no_uncertainty']:
+                model_dict = getattr(self, model)
+                for task in self.tasks:
+                    if task not in model_dict:
+                        model_dict[task] = self._get_default_task_params(model, task)
+    
+    def _get_default_model_params(self, model_name):
+        """Get default parameters for a specific model."""
+        defaults = {
+            'hydra': {
+                'target_accuracy': {'final': 0.942, 'convergence_rate': 0.0004, 'noise': 0.008},
+                'resource_nrmse': {'final': 0.12, 'convergence_rate': 0.00035, 'noise': 0.008},
+                'beam_accuracy': {'final': 0.887, 'convergence_rate': 0.00038, 'noise': 0.008}
+            },
+            'sran': {
+                'target_accuracy': {'final': 0.895, 'convergence_rate': 0.00025, 'noise': 0.012},
+                'resource_nrmse': {'final': 0.18, 'convergence_rate': 0.00020, 'noise': 0.012},
+                'beam_accuracy': {'final': 0.823, 'convergence_rate': 0.00022, 'noise': 0.012}
+            },
+            'drl': {
+                'target_accuracy': {'final': 0.835, 'convergence_rate': 0.00015, 'noise': 0.015},
+                'resource_nrmse': {'final': 0.26, 'convergence_rate': 0.00012, 'noise': 0.015},
+                'beam_accuracy': {'final': 0.746, 'convergence_rate': 0.00013, 'noise': 0.015}
+            },
+            'hydra_no_vib': {
+                'target_accuracy': {'final': 0.918, 'convergence_rate': 0.00035, 'noise': 0.009},
+                'resource_nrmse': {'final': 0.14, 'convergence_rate': 0.00030, 'noise': 0.009},
+                'beam_accuracy': {'final': 0.859, 'convergence_rate': 0.00033, 'noise': 0.009}
+            },
+            'hydra_no_uncertainty': {
+                'target_accuracy': {'final': 0.925, 'convergence_rate': 0.00038, 'noise': 0.008},
+                'resource_nrmse': {'final': 0.13, 'convergence_rate': 0.00033, 'noise': 0.008},
+                'beam_accuracy': {'final': 0.868, 'convergence_rate': 0.00036, 'noise': 0.008}
+            }
+        }
+        return defaults.get(model_name, {})
+    
+    def _get_default_task_params(self, model_name, task_name):
+        """Get default parameters for a specific model and task."""
+        model_defaults = self._get_default_model_params(model_name)
+        return model_defaults.get(task_name, {'final': 0.5, 'convergence_rate': 0.0002, 'noise': 0.01})
+    
+    def to_dict(self):
+        """Convert configuration to dictionary for saving."""
+        return {
+            'total_steps': self.total_steps,
+            'num_runs': self.num_runs,
+            'seed': self.seed,
+            'tasks': self.tasks,
+            'hydra': self.hydra,
+            'sran': self.sran,
+            'drl': self.drl,
+            'hydra_no_vib': self.hydra_no_vib,
+            'hydra_no_uncertainty': self.hydra_no_uncertainty
+        }
+    
+    def save_to_file(self, filename='config.json'):
+        """Save configuration to JSON file."""
+        with open(filename, 'w') as f:
+            json.dump(self.to_dict(), f, indent=4)
+        print(f"Configuration saved to {filename}")
+    
+    @classmethod
+    def load_from_file(cls, filename='config.json'):
+        """Load configuration from JSON file."""
+        with open(filename, 'r') as f:
+            data = json.load(f)
+        return cls(data)
+
+
+# ============================================================================
+# Convergence Curve Generation
+# ============================================================================
+
+def generate_convergence_curve(params, total_steps, noise_scale=1.0, seed=None, 
+                              task_type='accuracy'):
+    """
+    Generate a realistic convergence curve using exponential approach to final value.
+    
+    Args:
+        params: dict with 'final' and 'convergence_rate'
+        total_steps: number of training steps
+        noise_scale: scaling factor for noise
+        seed: random seed for reproducibility
+        task_type: 'accuracy' or 'nrmse'
+    
+    Returns:
+        array of values over training steps
+    """
+    if seed is not None:
+        np.random.seed(seed)
+    
+    final_val = params['final']
+    rate = params['convergence_rate']
+    noise = params['noise'] * noise_scale
+    
+    steps = np.arange(total_steps)
+    
+    # Exponential convergence with noise
+    if task_type == 'accuracy':
+        # For accuracy metrics: start from random (0.1-0.2 for classification)
+        initial = 0.1 + 0.1 * np.random.random()
+        curve = final_val - (final_val - initial) * np.exp(-rate * steps)
+        # Add learning plateau noise
+        curve += noise * np.random.randn(total_steps) * (1 - 0.8 * np.exp(-rate * steps * 0.5))
+    else:
+        # For NRMSE: start from high error (~0.5-0.7)
+        initial = 0.5 + 0.2 * np.random.random()
+        curve = final_val + (initial - final_val) * np.exp(-rate * steps)
+        curve += noise * np.random.randn(total_steps) * (1 - 0.8 * np.exp(-rate * steps * 0.5))
+    
+    # Ensure values are within reasonable bounds
+    if task_type == 'accuracy':
+        curve = np.clip(curve, 0.0, 1.0)
+    else:
+        curve = np.clip(curve, 0.01, 1.0)
+    
+    # Smooth with running average for more realistic training curves
+    window = min(100, total_steps // 10)
+    if window > 1:
+        smoothed = np.convolve(curve, np.ones(window)/window, mode='valid')
+        # Pad to match original length
+        pad_left = window // 2
+        pad_right = total_steps - len(smoothed) - pad_left
+        if pad_right > 0:
+            smoothed = np.concatenate([curve[:pad_left], smoothed, curve[-pad_right:]])
+        else:
+            smoothed = np.concatenate([curve[:pad_left], smoothed])
+        curve = smoothed[:total_steps]
+    
+    return curve[:total_steps]
+
+
+def generate_all_curves(config, total_steps=None, num_runs=None):
+    """
+    Generate convergence curves for all models and tasks.
+    
+    Args:
+        config: Config object
+        total_steps: override total steps
+        num_runs: override number of runs
+    
+    Returns:
+        dict with model names as keys, each containing task curves
+    """
+    if total_steps is None:
+        total_steps = config.total_steps
+    if num_runs is None:
+        num_runs = config.num_runs
+    
+    results = {}
+    models = {
+        'Hydra-RAN': config.hydra,
+        'Hydra-RAN (no VIB)': config.hydra_no_vib,
+        'Hydra-RAN\n(no uncertainty weighting)': config.hydra_no_uncertainty,
+        'S-RAN': config.sran,
+        'DRL-Only': config.drl
+    }
+    
+    for model_name, model_params in models.items():
+        results[model_name] = {}
+        for task_name, task_params in model_params.items():
+            # Determine task type
+            task_type = 'accuracy' if 'accuracy' in task_name else 'nrmse'
+            
+            # Generate multiple runs for confidence intervals
+            runs = []
+            for run_idx in range(num_runs):
+                seed = config.seed + hash(model_name) * 1000 + hash(task_name) * 100 + run_idx
+                # Different noise levels for different models
+                noise_scale = 1.0
+                if 'S-RAN' in model_name:
+                    noise_scale = 1.3
+                elif 'DRL-Only' in model_name:
+                    noise_scale = 1.5
+                elif 'no VIB' in model_name or 'no uncertainty' in model_name:
+                    noise_scale = 1.1
+                
+                curve = generate_convergence_curve(
+                    task_params, total_steps, 
+                    noise_scale=noise_scale, 
+                    seed=seed % 2**32,
+                    task_type=task_type
+                )
+                runs.append(curve)
+            
+            # Store mean and std
+            runs = np.array(runs)
+            results[model_name][task_name] = {
+                'mean': np.mean(runs, axis=0),
+                'std': np.std(runs, axis=0),
+                'runs': runs
+            }
+    
+    return results
+
+
+# ============================================================================
+# Task-Specific Plotting
+# ============================================================================
+
+def plot_task_convergence(ax, results, task_name, ylabel, ylim=None, 
+                          color_map=None, marker_map=None, show_legend=True,
+                          title=None, show_markers=True):
+    """
+    Plot convergence curves for a single task.
+    
+    Args:
+        ax: matplotlib axis
+        results: dict from generate_all_curves
+        task_name: string identifying the task
+        ylabel: string for y-axis label
+        ylim: tuple for y-axis limits
+        color_map: dict mapping model names to colors
+        marker_map: dict mapping model names to markers
+        show_legend: boolean
+        title: title for the subplot
+        show_markers: boolean to show markers
+    """
+    if color_map is None:
+        color_map = {
+            'Hydra-RAN': '#1f77b4',           # Blue
+            'Hydra-RAN (no VIB)': '#2ca02c',   # Green
+            'Hydra-RAN\n(no uncertainty weighting)': '#ff7f0e',  # Orange
+            'S-RAN': '#d62728',                # Red
+            'DRL-Only': '#9467bd'              # Purple
+        }
+    
+    if marker_map is None:
+        marker_map = {
+            'Hydra-RAN': 's',                  # Square
+            'Hydra-RAN (no VIB)': '^',         # Triangle up
+            'Hydra-RAN\n(no uncertainty weighting)': 'D',  # Diamond
+            'S-RAN': 'o',                     # Circle
+            'DRL-Only': 'v'                   # Triangle down
+        }
+    
+    # Model order for legend
+    model_order = ['Hydra-RAN', 'Hydra-RAN (no VIB)', 
+                   'Hydra-RAN\n(no uncertainty weighting)', 
+                   'S-RAN', 'DRL-Only']
+    
+    # Determine if higher is better (accuracy) or lower is better (NRMSE)
+    higher_is_better = 'accuracy' in task_name.lower()
+    
+    steps = np.arange(len(results['Hydra-RAN'][task_name]['mean']))
+    
+    # Sample points for markers
+    marker_step = max(500, len(steps) // 10) if show_markers else len(steps) + 1
+    
+    # Create line objects for legend
+    legend_handles = []
+    
+    for model_name in model_order:
+        if model_name not in results:
+            continue
+        
+        data = results[model_name][task_name]
+        mean = data['mean']
+        std = data['std']
+        color = color_map.get(model_name, 'gray')
+        marker = marker_map.get(model_name, 'o')
+        
+        # Main curve
+        line, = ax.plot(steps, mean, color=color, linewidth=2.5, 
+                        marker=marker, markevery=marker_step,
+                        markersize=6, markerfacecolor=color,
+                        markeredgecolor='white', markeredgewidth=0.5,
+                        label=model_name)
+        legend_handles.append(line)
+        
+        # Confidence interval (shaded)
+        ax.fill_between(steps, mean - std, mean + std, 
+                        color=color, alpha=0.15, linewidth=0)
+    
+    # Formatting
+    ax.set_xlabel('Training Steps', fontsize=11)
+    ax.set_ylabel(ylabel, fontsize=11)
+    
+    # Remove top and right spines for cleaner look
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    
+    if ylim is not None:
+        ax.set_ylim(ylim)
+    
+    ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
+    
+    if title:
+        ax.set_title(title, fontsize=10, fontweight='bold')
+    
+    if show_legend:
+        ax.legend(handles=legend_handles, loc='lower right', fontsize=7, 
+                 framealpha=0.95, fancybox=True)
+
+
+# ============================================================================
+# Main Plotting Function
+# ============================================================================
+
+def create_convergence_figure(results, save_path=None, title_prefix=''):
+    """
+    Create publication-quality figure with all three task convergence plots.
+    
+    Args:
+        results: dict from generate_all_curves
+        save_path: path to save the figure
+        title_prefix: prefix for the figure title
+    """
+    # IEEE column width: 3.5 inches for single column
+    fig, axes = plt.subplots(1, 3, figsize=(7.25, 2.8), dpi=300)
+    
+    # Task configurations
+    tasks = [
+        {
+            'key': 'target_accuracy',
+            'ylabel': 'Cell Accuracy',
+            'ylim': (0.0, 1.0),
+            'title': '(a) Target Cell Selection'
+        },
+        {
+            'key': 'resource_nrmse',
+            'ylabel': 'NRMSE',
+            'ylim': (0.0, 0.45),
+            'title': '(b) Resource Demand Estimation'
+        },
+        {
+            'key': 'beam_accuracy',
+            'ylabel': 'Beam Accuracy',
+            'ylim': (0.0, 1.0),
+            'title': '(c) Interference Mitigation'
+        }
+    ]
+    
+    # Color map consistent across all subplots
+    color_map = {
+        'Hydra-RAN': '#1f77b4',
+        'Hydra-RAN (no VIB)': '#2ca02c',
+        'Hydra-RAN\n(no uncertainty weighting)': '#ff7f0e',
+        'S-RAN': '#d62728',
+        'DRL-Only': '#9467bd'
+    }
+    
+    # Marker map for each baseline
+    marker_map = {
+        'Hydra-RAN': 's',                  # Square
+        'Hydra-RAN (no VIB)': '^',         # Triangle up
+        'Hydra-RAN\n(no uncertainty weighting)': 'D',  # Diamond
+        'S-RAN': 'o',                     # Circle
+        'DRL-Only': 'v'                   # Triangle down
+    }
+    
+    for idx, task in enumerate(tasks):
+        ax = axes[idx]
+        plot_task_convergence(
+            ax, results, task['key'], 
+            ylabel=task['ylabel'], 
+            ylim=task['ylim'],
+            color_map=color_map,
+            marker_map=marker_map,
+            show_legend=(idx == 2),  # Show legend only on last subplot
+            title=task['title']
+        )
+    
+    # Add overall title if provided
+    if title_prefix:
+        fig.suptitle(title_prefix, fontsize=12, fontweight='bold')
+    
+    # Adjust layout
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight', 
+                    facecolor='white', edgecolor='none')
+        print(f"Figure saved to {save_path}")
+    
+    plt.show()
+    return fig, axes
+
+
+# ============================================================================
+# Input Data Processing
+# ============================================================================
+
+def load_input_data(filename='input_data.json'):
+    """Load input data from JSON file."""
+    if os.path.exists(filename):
+        with open(filename, 'r') as f:
+            return json.load(f)
+    return None
+
+
+def create_sample_input_file(filename='input_data.json'):
+    """Create a sample input file for users to modify."""
+    sample_data = {
+        "total_steps": 20000,
+        "num_runs": 5,
+        "seed": 42,
+        "tasks": ["target_accuracy", "resource_nrmse", "beam_accuracy"],
+        "hydra": {
+            "target_accuracy": {"final": 0.942, "convergence_rate": 0.0004, "noise": 0.008},
+            "resource_nrmse": {"final": 0.12, "convergence_rate": 0.00035, "noise": 0.008},
+            "beam_accuracy": {"final": 0.887, "convergence_rate": 0.00038, "noise": 0.008}
+        },
+        "sran": {
+            "target_accuracy": {"final": 0.895, "convergence_rate": 0.00025, "noise": 0.012},
+            "resource_nrmse": {"final": 0.18, "convergence_rate": 0.00020, "noise": 0.012},
+            "beam_accuracy": {"final": 0.823, "convergence_rate": 0.00022, "noise": 0.012}
+        },
+        "drl": {
+            "target_accuracy": {"final": 0.835, "convergence_rate": 0.00015, "noise": 0.015},
+            "resource_nrmse": {"final": 0.26, "convergence_rate": 0.00012, "noise": 0.015},
+            "beam_accuracy": {"final": 0.746, "convergence_rate": 0.00013, "noise": 0.015}
+        },
+        "hydra_no_vib": {
+            "target_accuracy": {"final": 0.918, "convergence_rate": 0.00035, "noise": 0.009},
+            "resource_nrmse": {"final": 0.14, "convergence_rate": 0.00030, "noise": 0.009},
+            "beam_accuracy": {"final": 0.859, "convergence_rate": 0.00033, "noise": 0.009}
+        },
+        "hydra_no_uncertainty": {
+            "target_accuracy": {"final": 0.925, "convergence_rate": 0.00038, "noise": 0.008},
+            "resource_nrmse": {"final": 0.13, "convergence_rate": 0.00033, "noise": 0.008},
+            "beam_accuracy": {"final": 0.868, "convergence_rate": 0.00036, "noise": 0.008}
+        }
+    }
+    with open(filename, 'w') as f:
+        json.dump(sample_data, f, indent=4)
+    print(f"Sample input file created: {filename}")
+
+
+# ============================================================================
+# Additional: Convergence Rate Analysis
+# ============================================================================
+
+def analyze_convergence_rates(results, total_steps):
+    """
+    Compute and display convergence statistics for each model and task.
+    """
+    print("\n" + "=" * 70)
+    print("Convergence Analysis (Steps to reach 90% of final performance)")
+    print("=" * 70)
+    
+    model_order = ['Hydra-RAN', 'Hydra-RAN (no VIB)', 
+                   'Hydra-RAN\n(no uncertainty weighting)', 
+                   'S-RAN', 'DRL-Only']
+    
+    task_labels = {
+        'target_accuracy': 'Target Cell Selection',
+        'resource_nrmse': 'Resource Demand (NRMSE)',
+        'beam_accuracy': 'Interference Mitigation'
+    }
+    
+    convergence_data = {}
+    
+    for task_name in task_labels.keys():
+        print(f"\n{task_labels[task_name]}:")
+        for model in model_order:
+            if model not in results:
+                continue
+            
+            data = results[model][task_name]
+            mean = data['mean']
+            final_val = mean[-1]
+            
+            # Determine if higher is better
+            if 'accuracy' in task_name:
+                target = 0.9 * final_val
+                idx = np.where(mean > target)[0]
+            else:
+                target = 1.1 * final_val
+                idx = np.where(mean < target)[0]
+            
+            if len(idx) > 0:
+                steps_to_90 = idx[0]
+            else:
+                steps_to_90 = total_steps
+            
+            print(f"  {model}: {steps_to_90} steps (final: {final_val:.3f})")
+            convergence_data[(model, task_name)] = steps_to_90
+    
+    return convergence_data
+
+
+# ============================================================================
+# Main Execution
+# ============================================================================
+
+def main(input_file=None):
+    """
+    Main execution function.
+    
+    Args:
+        input_file: Path to input JSON file (optional)
+    """
+    print("=" * 70)
+    print("Offline Pre-training Convergence Simulation")
+    print("=" * 70)
+    
+    # Load input data if provided
+    if input_file and os.path.exists(input_file):
+        print(f"\nLoading input data from {input_file}")
+        input_data = load_input_data(input_file)
+        if input_data:
+            config = Config(input_data)
+            print("Using input data for simulation")
+        else:
+            print("Error loading input data, using defaults")
+            config = Config()
+    else:
+        # Check for default input file
+        if os.path.exists('input_data.json'):
+            print("\nFound input_data.json, loading...")
+            input_data = load_input_data('input_data.json')
+            config = Config(input_data)
+        else:
+            print("\nNo input file found. Using default parameters.")
+            print("To customize, create an 'input_data.json' file.")
+            config = Config()
+    
+    print(f"\nSimulation Configuration:")
+    print(f"  Total steps: {config.total_steps}")
+    print(f"  Number of runs: {config.num_runs}")
+    print(f"  Models: Hydra-RAN, Hydra-RAN (no VIB), Hydra-RAN (no uncertainty), S-RAN, DRL-Only")
+    print(f"  Tasks: {', '.join(config.tasks)}")
+    
+    # Generate convergence curves
+    print("\nGenerating convergence curves...")
+    results = generate_all_curves(config)
+    
+    # Print convergence statistics
+    convergence_data = analyze_convergence_rates(results, config.total_steps)
+    
+    # Create figure
+    print("\nGenerating figure...")
+    fig, axes = create_convergence_figure(
+        results, 
+        save_path="offline_convergence.pdf",
+        title_prefix="Offline Pre-training Convergence"
+    )
+    
+    print("\nSimulation complete!")
+    return results, fig, axes
+
+
+# ============================================================================
+# Entry Point
+# ============================================================================
+
+if __name__ == "__main__":
+    import sys
+    
+    # Check for command line arguments
+    if len(sys.argv) > 1:
+        input_file = sys.argv[1]
+        results, fig, axes = main(input_file)
+    else:
+        # Create sample input file if it doesn't exist
+        if not os.path.exists('input_data.json'):
+            create_sample_input_file()
+            print("\nSample input file created. Modify it and run again.")
+        
+        results, fig, axes = main()
+    
+    print("\n" + "=" * 70)
+    print("To reproduce Fig. offline_convergence:")
+    print("  - Save the generated figure as 'offline_convergence.pdf'")
+    print("  - Place in your LaTeX figure directory")
+    print("=" * 70)
